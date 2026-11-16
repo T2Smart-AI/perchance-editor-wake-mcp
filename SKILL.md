@@ -1,7 +1,7 @@
 ---
 name: perchance-editor
 description: Read, patch, and live-test Perchance generators over MCP.
-version: 2.4.0
+version: 2.8.0
 author: Nightomaru
 license: MIT
 ---
@@ -52,6 +52,10 @@ perch_stop
 |---|---|---|
 | Browser-free | `perch_pull`, `perch_fetch_generator`, `perch_src`, `perch_list_src` | `perch_list_src` shows the last OWNER save only — blind to the collab room |
 | Session | `perch_start`, `perch_status`, `perch_stop` | `perch_status` is cheap (~2ms) and carries the preview health — call it liberally |
+ | Built-in AI helper | `perch_ai_wake`, `perch_ai_ask`, `perch_ai_read`, `perch_ai_probe`, `perch_ai_status` | the ONLY path to the editor's integrated agent — chatbox `#aiAgentInputEl` + `#aiAgentSendBtn`; wake after any src/file-panel work; `ask` times out → poll `read`; `probe` diagnoses a dead composer, `status` is the cheap link check |
+| Diagnosis | `perch_ping`, `perch_doctor` | no session needed — call `perch_doctor` FIRST when anything looks wrong; it names the first broken link and the next action |
+| Agent shelf (offline, file-backed) | `perch_think`, `perch_memory`, `perch_todo`, `perch_clock`, `perch_calc`, `perch_run_js`, `perch_web_fetch`, `perch_web_search` | survive the ~20min idle browser close; state lives in `.perch-shelf/shelf.json` — never needs `perch_start` |
+| Discovery | `perch_skills` | static catalog of the 13 available skills |
 | Recovery / src | `perch_navigate`, `perch_upload_src`, `perch_delete_src` | prefer `filePath`/`url` over inline `content`; binary-vs-text is content-sniffed; results carry `landed`/`integrity`/`sha256` |
 | Reading | `perch_read`, `perch_grep`, `perch_outline`, `perch_console`, `perch_errors`, `perch_snapshot` | |
 | Writing | `perch_patch` (preferred, batch), `perch_edit`, `perch_write`, `perch_write_file`, `perch_copy_lines` | `perch_write_file` is the only path that carries a multi-MB outputTemplate; `oldString not found` → grep the real text first |
@@ -98,6 +102,54 @@ editor still looks healthy. Recover in order:
 2. Switch engine — `perch_start {engine: "chrome", headed: true}`. The signal is
    `perch_status.preview.loaderError` (or `perch_start`'s `previewDegraded`), and
    the start result's `attempts` says which engines were already tried.
+
+**Built-in AI helper (chatbox bridge).** The editor's integrated coding agent
+has no API — an outside agent reaches it only through
+`<textarea id="aiAgentInputEl">` + `<button id="aiAgentSendBtn">` inside the
+shared `#aiAgentPanelEl`. Recipe:
+`perch_ai_wake` (re-clicks the AI tab when the panel sits on the files view
+after an upload/delete) → `perch_ai_ask {text}` (fills + real-clicks Send,
+waits up to `timeout` for the reply) → on `timedOut:true`, poll
+`perch_ai_read {limit}` until `busyHint` is false and read the tail. Keep
+messages ≤12000 chars (split bigger jobs); AI code edits land as live room
+writes like your own, so verify with `perch_grep`/`perch_errors`. If `ask`
+fails outright, `perch_ai_probe` reports the composer's selector/rect/
+visibility/send-button state to diagnose it; `perch_ai_status` is the cheap
+poll between `ask` and `read`. Send escalation inside `ask` is click,
+eval-click, then one Enter keypress; all budgets live in
+`PerchSession.AI_WAKE` (single place to tune). Never use
+`perch_type`/`perch_click` on `#aiAgentInputEl`/`#aiAgentSendBtn` directly —
+the bridge handles focus, framework input events, and the busy/idle settle.
+
+**Doctor-first diagnosis.** When anything looks wrong, call `perch_doctor`
+before anything else — it needs no session and checks the chain in order
+(session → generator docs → preview → Cloudflare → AI chat → idle timeout),
+returning the first broken link plus a concrete `nextAction`. `perch_ping` is
+the even cheaper liveness check (server up, no session required).
+
+**Persistence.** The editor identifies the agent per browser profile
+(`localStorage perchanceEditorClientId`). The default fresh profile rotates
+that id on every start and wipes chat history — pass
+`perch_start {persistProfile: true}` to keep ONE profile dir
+(`.perch-profile`, or `profileDir`/`PERCH_PROFILE_DIR`) across restarts.
+Never clear the profile's site data while persistence matters. Switch
+engines or the profile flag forces a relaunch; the start result reports the
+active `profile`. `_ensureAiPanel` waits for the lazily injected composer
+before spending its tab-click budget, and `ask` settles for an enabled Send
+before clicking — both best-effort with the click/eval-click/Enter fallbacks
+behind them.
+
+**Offline shelf (survives the browser close).** The `perch_think` /
+`perch_memory` / `perch_todo` / `perch_clock` / `perch_calc` / `perch_run_js` /
+`perch_web_fetch` / `perch_web_search` family never touches the browser — use
+it for scratch reasoning, reminders, todo boards, arithmetic, sandboxed JS,
+and quick web lookups while the editor is closed or CF-blocked. Shelf state
+(`memory`, `todo`) persists in `.perch-shelf/shelf.json` next to the server.
+
+**Export before risky rewrites.** `perch_export` zips `main.pjs` + `index.html`
++ every `src/` file (STORE compression, no dependencies) straight from the
+public CDN — no session needed. Take one before any whole-pane rewrite so a
+bad write is always recoverable.
 
 **`src/` state before the owner saves** is invisible to `perch_list_src`. Eval the
 editor frame instead:

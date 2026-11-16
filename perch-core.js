@@ -36,6 +36,145 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 const IDLE_MS = 20 * 60 * 1000;
 const MIRROR_ROOT = path.join(__dirname, '.perch-mirror');
+// ---------------- agent shelf (offline, browser-free) ----------------
+// Mirrors the MCP Bridge generator's native shelf (its src/shelf.js): durable
+// reasoning scratchpad, memory, todos, clock, calc and worker-style JS — all
+// file-backed under .perch-shelf/ so an agent keeps continuity across the
+// ~20 min browser idle-close, compaction, and even without perch_start.
+const SHELF_DIR = path.join(__dirname, '.perch-shelf');
+const SHELF_FILE = path.join(SHELF_DIR, 'shelf.json');
+
+function _shelfLoad() {
+  try {
+    const raw = fs.readFileSync(SHELF_FILE, 'utf8');
+    const s = JSON.parse(raw);
+    if (!s || typeof s !== 'object') throw new Error('bad shelf');
+    if (!s.mem || typeof s.mem !== 'object') s.mem = {};
+    if (!Array.isArray(s.thoughts)) s.thoughts = [];
+    if (!Array.isArray(s.todos)) s.todos = [];
+    return s;
+  } catch (e) {
+    return { mem: {}, thoughts: [], todos: [] };
+  }
+}
+function _shelfSave(s) {
+  fs.mkdirSync(SHELF_DIR, { recursive: true });
+  fs.writeFileSync(SHELF_FILE, JSON.stringify(s, null, 2), 'utf8');
+}
+
+function _stripHtml(html) {
+  let t = String(html || '');
+  t = t.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ');
+  t = t.replace(/<[^>]+>/g, ' ');
+  t = t.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  return t.replace(/\s+/g, ' ').trim();
+}
+
+// Safe calculator (ports the bridge shelf's calcSafe): digit/operator input
+// plus explicit Math.* aliases only — no variables, no function definitions.
+function _calcSafe(e) {
+  e = String(e || '');
+  if (!/^[0-9+\-*/().,%\sA-Za-z^]*$/.test(e)) return { error: 'invalid characters (numbers, +-*/().,%,^ and Math names only)' };
+  const alias = { sqrt: 'Math.sqrt', cbrt: 'Math.cbrt', sin: 'Math.sin', cos: 'Math.cos', tan: 'Math.tan', asin: 'Math.asin', acos: 'Math.acos', atan: 'Math.atan', log: 'Math.log10', ln: 'Math.log', exp: 'Math.exp', abs: 'Math.abs', pow: 'Math.pow', floor: 'Math.floor', ceil: 'Math.ceil', round: 'Math.round', min: 'Math.min', max: 'Math.max', PI: 'Math.PI', E: 'Math.E' };
+  const names = Object.keys(alias).sort((a, b) => b.length - a.length);
+  for (const n of names) e = e.replace(new RegExp('\\b' + n + '\\b', 'g'), alias[n]);
+  try {
+    const v = Function('Math', 'return (' + e.replace(/\^/g, '**') + ')')(Math);
+    if (typeof v !== 'number' || !isFinite(v)) return { error: 'not a finite number' };
+    return { value: String(v) };
+  } catch (err) { return { error: 'error: ' + err.message }; }
+}
+
+// STORE-method zip writer (no compression, no dependencies) — ports the
+// bridge generator's DownloadsPlugin.makeZip CRC32 framing to Node Buffers.
+const _CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function _crc32(u8) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < u8.length; i++) c = _CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function _buildStoreZip(files) {
+  // files: [{name, data: Buffer}]. Names stored as-is (flat or a/b paths).
+  const parts = [];
+  const central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = Buffer.from(String(f.name), 'utf8');
+    const data = Buffer.isBuffer(f.data) ? f.data : Buffer.from(String(f.data || ''), 'utf8');
+    const crc = _crc32(data);
+    const size = data.length;
+    const lfh = Buffer.alloc(30);
+    lfh.writeUInt32LE(0x04034b50, 0);
+    lfh.writeUInt16LE(20, 4);
+    lfh.writeUInt16LE(0, 6);
+    lfh.writeUInt16LE(0, 8);
+    lfh.writeUInt16LE(0, 10);
+    lfh.writeUInt16LE(0, 12);
+    lfh.writeUInt32LE(crc, 14);
+    lfh.writeUInt32LE(size, 18);
+    lfh.writeUInt32LE(size, 22);
+    lfh.writeUInt16LE(name.length, 26);
+    lfh.writeUInt16LE(0, 28);
+    parts.push(lfh, name, data);
+    const cd = Buffer.alloc(46);
+    cd.writeUInt32LE(0x02014b50, 0);
+    cd.writeUInt16LE(20, 4);
+    cd.writeUInt16LE(20, 6);
+    cd.writeUInt16LE(0, 8);
+    cd.writeUInt16LE(0, 10);
+    cd.writeUInt16LE(0, 12);
+    cd.writeUInt16LE(0, 14);
+    cd.writeUInt32LE(crc, 16);
+    cd.writeUInt32LE(size, 20);
+    cd.writeUInt32LE(size, 24);
+    cd.writeUInt16LE(name.length, 28);
+    cd.writeUInt16LE(0, 30);
+    cd.writeUInt16LE(0, 32);
+    cd.writeUInt16LE(0, 34);
+    cd.writeUInt16LE(0, 36);
+    cd.writeUInt32LE(0, 38);
+    cd.writeUInt32LE(offset, 42);
+    central.push(cd, name);
+    offset += 30 + name.length + size;
+  }
+  const cdBlob = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(files.length, 8);
+  eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(cdBlob.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+  return Buffer.concat([...parts, cdBlob, eocd]);
+}
+
+// Static agent-skill catalog (mirrors the bridge generator's src/mcp/tools.js
+// SKILLS: the same 13 plugin/skill ids). Served browser-free by perch_skills.
+const SKILLS = [
+  { id: 'ai-text-plugin', title: 'ai-text-plugin', description: 'Full reference for generateText: prompt options, image attachments, streaming, prefix-cache-friendly prompt design.' },
+  { id: 'comments-plugin', title: 'comments-plugin', description: 'Embedded comments/chat/guestbook widgets: channels, styling, moderation, hooks, permissioned channels.' },
+  { id: 'dynamic-metadata', title: 'dynamic-metadata', description: 'Query-aware $meta.dynamic(inputs) metadata for per-URL titles, descriptions, and social images.' },
+  { id: 'kv-plugin', title: 'kv-plugin', description: 'Per-folder key/value persistence over IndexedDB; save/load, inventories, settings.' },
+  { id: 'music-generation', title: 'music-generation', description: 'Using generate_music well: prompting, lyrics, wiring music into a generator.' },
+  { id: 'opencode', title: 'opencode', description: 'OpenCode itself: config, MCP, plugins, SDK, troubleshooting — the harness connector target.' },
+  { id: 'perchance-platform', title: 'perchance-platform', description: 'Deep reference for the Perchance engine and platform: DSL semantics, list-tree API, $meta, gotchas.' },
+  { id: 'report', title: 'report', description: 'Collect diagnostics and publish an OpenCode issue with GitHub CLI.' },
+  { id: 'secret-plugin', title: 'secret-plugin', description: 'Synchronous public-key encryption (ML-KEM): generateKeyPair, encrypt, decrypt.' },
+  { id: 'server-plugin', title: 'server-plugin', description: 'Build realtime multiplayer/socket servers: createServerSocket, RPC, pub/sub, durable state, admin auth.' },
+  { id: 'super-fetch-plugin', title: 'super-fetch-plugin', description: 'CORS-free fetch() drop-in for the generator at runtime.' },
+  { id: 'text-to-image-plugin', title: 'text-to-image-plugin', description: 'Full reference for generateImage: prompt options, gallery, moderation.' },
+  { id: 'upload-plugin', title: 'upload-plugin', description: 'Immutable/editable file uploads, temp-file limits, deletion, NSFW-check API.' },
+];
 // Locale/timezone are fingerprint inputs for the CF risk score; keep them
 // consistent with the UA above and overridable by the caller.
 const LOCALE = 'en-US';
@@ -331,7 +470,47 @@ class PerchSession {
     throw new Error('preview iframe not found (preview not loaded?)');
   }
 
+  // Persistent profile (live-editor finding: the agent's identity lives in
+  // localStorage "perchanceEditorClientId" — a fresh browser.newContext on
+  // every start rotates it and wipes session history). With persistProfile,
+  // the browser opens ONE user-data dir (launchPersistentContext), so the
+  // client id, AI chat history and editor state survive restarts. The dir
+  // defaults to .perch-profile under the server's working directory.
+  async _openPersistent(width, height) {
+    const name = this.engine || 'firefox';
+    const headless = !this.headed;
+    const viewport = { width, height };
+    if (this.ctx) { try { await this.ctx.close(); } catch {} this.ctx = null; }
+    if (this.browser) { try { await this.browser.close(); } catch {} this.browser = null; }
+    let ctx;
+    if (name === 'patchright') {
+      const pr = loadPatchright();
+      ctx = await pr.chromium.launchPersistentContext(this.profileDir, { headless, viewport });
+    } else {
+      const pw = loadChromium();
+      if (name === 'firefox') {
+        if (!pw.firefox) throw new Error('playwright firefox binary missing — run `npx playwright install firefox`');
+        ctx = await pw.firefox.launchPersistentContext(this.profileDir, { headless, viewport });
+      } else {
+        const spec = ENGINES[name] || ENGINES.chrome;
+        ctx = await pw.chromium.launchPersistentContext(this.profileDir, {
+          headless, viewport,
+          args: spec.stealth ? STEALTH_ARGS : [],
+          locale: LOCALE, timezoneId: TIMEZONE,
+        });
+        if (spec.stealth) await ctx.addInitScript(STEALTH_INIT);
+      }
+    }
+    this._runningEngine = name;
+    this.effectiveEngine = name;
+    try { this.browser = (ctx.browser && ctx.browser()) || null; } catch { this.browser = null; }
+    this.ctx = ctx;
+    this._ensureIdle();
+    return ctx;
+  }
+
   async _newContext(width, height) {
+    if (this.persistProfile && this.profileDir) return await this._openPersistent(width, height);
     const running = ENGINES[this._runningEngine] || ENGINES.firefox;
     const opts = { viewport: { width, height } };
     if (running.family === 'firefox' || !running.stealth) {
@@ -356,6 +535,12 @@ class PerchSession {
   }
 
   async _launch(headed, width, height) {
+    // Persistent profile: skip the throwaway browser launch — the profile
+    // dir IS the browser context (launchPersistentContext inside _newContext).
+    if (this.persistProfile && this.profileDir) {
+      this.engine = this.engine || 'firefox';
+      return await this._newContext(width, height);
+    }
     const want = this.engine || 'firefox';
     let r;
     try {
@@ -542,16 +727,24 @@ class PerchSession {
   }
 
   // One-shot entry: launch (if needed) + load generator + collab key.
-  async start({ name, collabKey = null, headed = false, width = 1500, height = 950, force = false, engine = null, engineChain = null } = {}) {
+  async start({ name, collabKey = null, headed = false, width = 1500, height = 950, force = false, engine = null, engineChain = null, persistProfile = false, profileDir = null } = {}) {
     this._touch();
     const t0 = Date.now();
     if (!name) throw new Error('missing generator name');
+    // Persistent profile keeps the editor's localStorage client id
+    // ("perchanceEditorClientId") and AI chat history across restarts.
+    const prevProfile = this.persistProfile ? this.profileDir : null;
+    this.persistProfile = !!persistProfile;
+    const envDir = (process.env.PERCH_PROFILE_DIR || '').trim();
+    this.profileDir = this.persistProfile ? (profileDir || envDir || path.resolve('.perch-profile')) : null;
+    const newProfile = this.persistProfile ? this.profileDir : null;
     if (engine) this.engine = engine; else this.engine = 'firefox'; // default: playwright firefox (clears perchance-subdomain CF challenges where chromium is flagged; falls back to chromium when the firefox binary is absent)
     // An explicit engine that differs from the RUNNING browser must take
     // effect: the ladder's 'newctx' step only recreates the context and would
     // otherwise silently keep the old engine (observed: engine:"chromium"
     // answered effectiveEngine:"patchright"). Force a relaunch in that case.
-    if (engine && this.browser && this._runningEngine && this._runningEngine !== this.engine) {
+    if ((engine && this.browser && this._runningEngine && this._runningEngine !== this.engine) ||
+        (this.browser && prevProfile !== newProfile)) {
       try { if (this.ctx) { await this.ctx.close(); } } catch {}
       try { await this.browser.close(); } catch {}
       this.ctx = null; this.browser = null; this.page = null; this.ready = false;
@@ -609,6 +802,7 @@ class PerchSession {
     return {
       ok: true, generator: name, collabKey, url, headed: this.headed, engine: this.engine,
       effectiveEngine: this.effectiveEngine || this.engine,
+      profile: this.persistProfile ? { persistent: true, dir: this.profileDir } : { persistent: false },
       docsReady: st.hasOutputView, recoveryStep: r.step, attempts: r.attempts, ms: Date.now() - t0,
       engineChain: chain,
       preview,
@@ -1666,6 +1860,878 @@ class PerchSession {
             ? 'panel reported "saved" but no store entry was observed — verify with perch_eval {frame:"editor", js:"JSON.stringify(window.srcState._internals.working)"}'
             : (renamedTo ? undefined : 'file was injected but never landed in the editor src store and the panel never reported "saved" — check perch_errors and retry'))),
     };
+  }
+
+  // ---------------- built-in AI helper (chatbox bridge) ----------------
+  // The editor's integrated AI coding agent has no API — only its chatbox:
+  //   <textarea id="aiAgentInputEl"> + <button id="aiAgentSendBtn">Send</button>
+  // inside #aiAgentPanelEl. These methods let ANY outside coding agent drive it
+  // over MCP: wake/ensure the chat view, send text, and harvest the reply.
+  //
+  // #aiAgentPanelEl is a SHARED side panel: the "files" view (input
+  //[data-ref="fileInput"]) and the AI chat view (input #aiAgentInputEl) replace
+  // each other. After perch_upload_src / perch_delete_src ran, the panel is
+  // sitting on the files view and the chatbox is simply not rendered — the
+  // wake step clicks back to the AI view. Probe-then-click, never blind.
+  // Central wake/send tuning, validated against a faithful in-browser
+  // simulator of the panel (chatbox + send button + strict controlled-mode
+  // framework + busy agent): 10/10 green x3 runs, triple-click race = 1 send.
+  // every aiAsk/aiWake parameter still overrides its own default.
+  static AI_WAKE = {
+    ensurePanelMs: 15000,  // _ensureAiPanel budget (tab-click retries)
+    fillTimeoutMs: 15000,  // locator.fill budget
+    seqDelayMs: 5,         // pressSequentially inter-key delay
+    seqTimeoutMs: 60000,   // pressSequentially budget (12k chars)
+    maxChars: 12000,       // chatbox send cap — split bigger jobs
+    sendConfirmMs: 12000,  // send-accepted confirmation window
+    enterFallbackAtMs: 4000, // no confirm by now -> try Enter key once
+    pollMs: 1000,          // reply-poll interval
+    stableMs: 2500,        // reply text must stop changing this long
+    waitIdleMs: 30000,     // pre-send busy-wait cap
+    askTimeoutMs: 180000,  // default reply wait
+  };
+  async _aiProbe(ed) {
+    return await evalMain(ed, () => {
+      const q = (s) => { try { return document.querySelector(s); } catch (e) { return null; } };
+      const panel = q('#aiAgentPanelEl');
+      const input = q('#aiAgentInputEl');
+      const send = q('#aiAgentSendBtn');
+      const vis = (el) => {
+        if (!el) return false;
+        try {
+          if (el.hidden) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 && r.height <= 0) return false;
+          const cs = window.getComputedStyle(el);
+          if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+          return true;
+        } catch (e) { return false; }
+      };
+      const panelText = panel ? String(panel.innerText || '') : '';
+      const busyRe = /thinking|generating|working on it|running|one moment|please wait|typing\.\.\.|stop\b/i;
+      let spinner = false;
+      try {
+        if (panel) {
+          spinner = !!panel.querySelector(
+            '.spinner, .loader, .loading, [class*="spinner"], [class*="loading"], [class*="thinking"], [aria-busy="true"]');
+        }
+      } catch (e) {}
+      // Message + location signals (additive: aiWake/aiRead ignore the extras).
+      // The bridge's chat.* probe tracks the same three for its status pill.
+      let messageCount = 0;
+      try {
+        if (panel) {
+          const seen = new Set();
+          for (const s of ['[class*="message"]', '[class*="chat"]', '[class*="reply"]', '[class*="assistant"]', '[class*="conversation"]', '[class*="thread"]']) {
+            try {
+              for (const el of panel.querySelectorAll(s)) {
+                if (!seen.has(el)) { seen.add(el); messageCount++; }
+              }
+            } catch (e2) {}
+          }
+        }
+      } catch (e) {}
+      let url = '', generatorName = '';
+      try {
+        url = location.href || '';
+        generatorName = (location.pathname || '').split('/').filter(Boolean).pop() || '';
+      } catch (e) {}
+      return {
+        panelExists: !!panel,
+        inputExists: !!input,
+        sendExists: !!send,
+        panelVisible: vis(panel),
+        inputVisible: vis(input),
+        sendVisible: vis(send),
+        inputEnabled: !!(input && !input.disabled && !input.readOnly),
+        sendEnabled: !!(send && !send.disabled && vis(send)),
+        sendDisabled: !!(send && send.disabled),
+        inputValueLen: input && typeof input.value === 'string' ? input.value.length : null,
+        panelTextLen: panelText.length,
+        busyHint: spinner || busyRe.test(panelText.slice(-1500)),
+        messageCount, url, generatorName,
+      };
+    }).catch((e) => ({ probeError: String((e && e.message) || e) }));
+  }
+
+  // Ensure the AI chat view (not the files view) is showing and the chatbox
+  // is visible + enabled. Clicks AI-view tabs until #aiAgentInputEl appears.
+  async _ensureAiPanel(ed, timeoutMs = PerchSession.AI_WAKE.ensurePanelMs) {
+    const t0 = Date.now();
+    const clicked = [];
+    // Lazy injection (live-editor finding: aiAgentClient.js loads lazily and
+    // injects the panel into #appEl after load) — wait for the composer to
+    // EXIST before spending the tab-click budget. Resolves instantly when the
+    // UI is already there; the MutationObserver-free waitForFunction covers
+    // both the slow-script and the already-rendered cases.
+    try {
+      await ed.waitForFunction(() => !!document.querySelector('#aiAgentInputEl'), null, { timeout: Math.min(10000, Math.max(1000, timeoutMs)) });
+    } catch (e) {}
+    let probe = await this._aiProbe(ed);
+    if (probe.inputVisible && probe.sendVisible) {
+      return { ok: true, alreadyAwake: true, probe, clicked, ms: Date.now() - t0 };
+    }
+    // Candidate tab/button labels that switch the shared panel back to chat.
+    // Ordered: most specific first. Matched case-insensitively against the
+    // button's own text + aria-label + title (NOT panel-wide innerText, which
+    // always contains chat history and would match everything).
+    while (Date.now() - t0 < timeoutMs) {
+      const next = await evalMain(ed, ({ already }) => {
+        const panel = document.querySelector('#aiAgentPanelEl');
+        const cands = [...document.querySelectorAll(
+          '#aiAgentPanelEl button, #aiAgentPanelEl [role="tab"], #aiAgentPanelEl [role="button"], ' +
+          'button, [role="tab"]')];
+        const seen = new Set(already);
+        const scoreOf = (t) => {
+          const s = String(t || '').toLowerCase().trim();
+          if (!s) return -1;
+          if (/^ai (helper|agent|chat)$/.test(s)) return 100;
+          if (/ai helper|ai agent|ai chat/.test(s)) return 90;
+          if (/^assistant$/.test(s)) return 80;
+          if (/^ai$/.test(s)) return 70;
+          if (/helper|assistant/.test(s)) return 60;
+          if (/🤖|✨/.test(s)) return 50;
+          if (/\bai\b/.test(s)) return 40;
+          return -1;
+        };
+        let best = null, bestScore = -1;
+        for (const b of cands) {
+          const lab = ((b.getAttribute && (b.getAttribute('aria-label') || b.getAttribute('title'))) || '') + ' ' + (b.innerText || b.textContent || '');
+          const key = (b.tagName || '') + '|' + lab.slice(0, 60);
+          if (seen.has(key)) continue;
+          const sc = scoreOf(lab);
+          if (sc > bestScore) { bestScore = sc; best = { key, label: lab.slice(0, 80) }; }
+        }
+        if (!best || bestScore < 0) {
+          // No labelled tab: the panel itself may be collapsed — look for its
+          // toggle by id/class as a last resort.
+          const tgl = document.querySelector('[id*="aiAgent"], [class*="aiAgent"]');
+          if (tgl && !already.includes('__paneltoggle__')) {
+            try { tgl.click(); } catch (e) {}
+            return { clicked: '__paneltoggle__', label: (tgl.tagName || '') };
+          }
+          return { clicked: null };
+        }
+        // Click the best candidate via real .click() (panel tabs are plain DOM).
+        for (const b of cands) {
+          const lab = ((b.getAttribute && (b.getAttribute('aria-label') || b.getAttribute('title'))) || '') + ' ' + (b.innerText || b.textContent || '');
+          const key = (b.tagName || '') + '|' + lab.slice(0, 60);
+          if (key === best.key) { try { b.click(); } catch (e) {} break; }
+        }
+        return { clicked: best.key, label: best.label };
+      }, { already: clicked }).catch(() => ({ clicked: null }));
+      if (next && next.clicked) clicked.push(next.clicked);
+      await this.page.waitForTimeout(800);
+      probe = await this._aiProbe(ed);
+      if (probe.inputVisible && probe.sendVisible) {
+        return { ok: true, alreadyAwake: false, probe, clicked, ms: Date.now() - t0 };
+      }
+      if (!next || !next.clicked) break; // nothing left to try
+      if (clicked.length > 10) break;
+    }
+    probe = await this._aiProbe(ed);
+    const ok = !!(probe.inputVisible && probe.sendVisible);
+    return {
+      ok, alreadyAwake: false, probe, clicked, ms: Date.now() - t0,
+      ...(ok ? {} : { error: 'AI chatbox not visible after ' + clicked.length + ' toggle click(s). The shared #aiAgentPanelEl may be on the files view or an unknown editor build moved the tabs — snapshot the editor frame and look for the AI tab.' }),
+    };
+  }
+
+  // Read the conversation transcript out of the panel DOM. Heuristic on
+  // purpose: the editor build renames its classes without notice, so anchor
+  // on role-ish attributes/classes first and fall back to text blocks.
+  async _readAiTranscript(ed, limit = 20) {
+    return await evalMain(ed, ({ limit }) => {
+      const panel = document.querySelector('#aiAgentPanelEl');
+      if (!panel) return { ok: false, error: 'panel #aiAgentPanelEl not found', messages: [] };
+      const msgs = [];
+      const seen = new Set();
+      const push = (role, text) => {
+        text = String(text || '').replace(/\s+\n/g, '\n').trim();
+        if (!text || text.length < 1) return;
+        if (text.length > 8000) text = text.slice(0, 8000) + '…(+truncated)';
+        const k = role + '|' + text.slice(0, 120);
+        if (seen.has(k)) return;
+        seen.add(k);
+        msgs.push({ role, text });
+      };
+      const guessRole = (el) => {
+        let hay = '';
+        try {
+          const cls = typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '';
+          const id = typeof el.id === 'string' ? el.id : '';
+          let attr = '';
+          if (el.getAttribute) {
+            attr = el.getAttribute('data-role') || el.getAttribute('data-author') || el.getAttribute('data-type') || '';
+          }
+          hay = (cls + ' ' + id + ' ' + attr).toLowerCase();
+        } catch (e) { hay = ''; }
+        if (/user|you|human|prompt/.test(hay)) return 'user';
+        if (/ai|assistant|agent|bot|response|answer/.test(hay)) return 'assistant';
+        return 'unknown';
+      };
+      // 1) explicit message-ish nodes
+      try {
+        const nodes = panel.querySelectorAll(
+          '[data-message], [data-role], [data-author], .message, .chat-message, .msg, ' +
+          '[class*="message"], [class*="chat-bubble"], [class*="bubble"], [class*="user-message"], [class*="ai-message"]');
+        for (const n of nodes) {
+          if (n.querySelector && n.querySelector('#aiAgentInputEl, #aiAgentSendBtn, input, textarea')) continue;
+          const t = (n.innerText || n.textContent || '').trim();
+          if (t.length < 2 || t.length > 12000) continue;
+          if (/^send$/i.test(t)) continue;
+          push(guessRole(n), t);
+        }
+      } catch (e) {}
+      // 2) fallback: direct child blocks with real text (skip toolbar/input rows)
+      if (!msgs.length) {
+        try {
+          const kids = [...panel.querySelectorAll('div')].filter(d =>
+            d.childElementCount <= 3 &&
+            !d.querySelector('#aiAgentInputEl, #aiAgentSendBtn, input[data-ref="fileInput"]'));
+          for (const d of kids) {
+            const t = (d.innerText || '').trim();
+            if (t.length < 20 || t.length > 6000) continue;
+            if (/files|upload|drag & drop/i.test(t) && t.length < 200) continue;
+            push(guessRole(d), t);
+          }
+        } catch (e) {}
+      }
+      const raw = String(panel.innerText || '');
+      const tail = msgs.slice(-Math.max(1, Math.min(limit || 20, 100)));
+      return { ok: true, count: msgs.length, messages: tail, rawTail: raw.slice(-6000), rawLen: raw.length };
+    }, { limit }).catch((e) => ({ ok: false, error: String((e && e.message) || e), messages: [] }));
+  }
+
+  // Wake-only: make the chatbox visible and report readiness + recent lines.
+  async aiWake({ timeout = 15000, limit = 10 } = {}) {
+    if (!this.page) throw new Error('call perch_start first');
+    this._touch();
+    const ed = await this._frame('editor');
+    const wake = await this._ensureAiPanel(ed, timeout);
+    const transcript = await this._readAiTranscript(ed, limit);
+    return {
+      ok: wake.ok, alreadyAwake: wake.alreadyAwake,
+      inputVisible: wake.probe && wake.probe.inputVisible,
+      sendVisible: wake.probe && wake.probe.sendVisible,
+      sendEnabled: wake.probe && wake.probe.sendEnabled,
+      busyHint: wake.probe && wake.probe.busyHint,
+      togglesClicked: wake.clicked,
+      transcript: transcript.messages || [],
+      rawTail: transcript.rawTail || '',
+      ms: wake.ms,
+      ...(wake.ok ? {} : { error: wake.error }),
+    };
+  }
+
+  // Read-only: transcript + chatbox state, never clicks anything.
+  async aiRead({ limit = 20 } = {}) {
+    if (!this.page) throw new Error('call perch_start first');
+    this._touch();
+    const ed = await this._frame('editor');
+    const probe = await this._aiProbe(ed);
+    const transcript = await this._readAiTranscript(ed, limit);
+    return {
+      ok: true, ...probe,
+      count: transcript.count != null ? transcript.count : (transcript.messages || []).length,
+      messages: transcript.messages || [],
+      rawTail: transcript.rawTail || '',
+      transcriptError: transcript.error || undefined,
+    };
+  }
+
+  // Full send-and-wait: wake -> fill #aiAgentInputEl -> click #aiAgentSendBtn ->
+  // poll until the reply lands and the agent goes idle. Long AI edits can take
+  // minutes; poll with perch_ai_read afterwards when it times out.
+  async aiAsk({ text, timeout = PerchSession.AI_WAKE.askTimeoutMs, pollMs = PerchSession.AI_WAKE.pollMs, waitIdleMs = PerchSession.AI_WAKE.waitIdleMs, limit = 20 } = {}) {
+    if (!this.page) throw new Error('call perch_start first');
+    const W = PerchSession.AI_WAKE;
+    if (!text || !String(text).trim()) return { ok: false, error: 'text is required (the message to send to the AI helper)' };
+    if (String(text).length > W.maxChars) return { ok: false, error: 'text too long (' + String(text).length + ' chars, max ' + W.maxChars + ' per send — split it)' };
+    this._touch();
+    const t0 = Date.now();
+    const ed = await this._frame('editor');
+    const wake = await this._ensureAiPanel(ed, 15000);
+    if (!wake.ok) return { ok: false, error: wake.error, stage: 'wake', probe: wake.probe, ms: Date.now() - t0 };
+    // Baseline transcript so we can tell OUR reply apart from history.
+    const before = await this._readAiTranscript(ed, 50);
+    const beforeCount = before.count || 0;
+    const beforeLast = (before.messages && before.messages.length)
+      ? before.messages[before.messages.length - 1].text.slice(0, 120) : null;
+    // If the agent is still busy from a previous task, wait for idle first.
+    {
+      const idleT0 = Date.now();
+      while (Date.now() - idleT0 < Math.min(waitIdleMs || 0, 60000)) {
+        const p = await this._aiProbe(ed);
+        if (!p.busyHint && p.sendEnabled) break;
+        await this.page.waitForTimeout(1000);
+      }
+    }
+    // Fill the chatbox with a REAL user gesture (framework listeners need it).
+    const msg = String(text);
+    let filledVia = 'fill';
+    try {
+      const loc = ed.locator('#aiAgentInputEl').first();
+      await loc.waitFor({ state: 'visible', timeout: 10000 });
+      try { await loc.click({ timeout: 5000 }); } catch (e) {}
+      try {
+        await loc.fill(msg, { timeout: W.fillTimeoutMs });
+      } catch (e) {
+        // Fallback for rich/editors that reject fill: clear via eval, then type.
+        filledVia = 'sequential';
+        await evalMain(ed, () => {
+          const el = document.querySelector('#aiAgentInputEl');
+          if (el) {
+            el.focus();
+            el.value = '';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        }).catch(() => {});
+        await loc.pressSequentially(msg.slice(0, W.maxChars), { delay: W.seqDelayMs, timeout: W.seqTimeoutMs });
+      }
+    } catch (e) {
+      return { ok: false, error: 'could not fill #aiAgentInputEl: ' + String((e && e.message) || e).slice(0, 200), stage: 'fill', ms: Date.now() - t0 };
+    }
+    // Verify the text actually landed (fill can silently no-op on some builds:
+    // bench T2d proves a stale .value leaves a controlled Send disabled).
+    // Escalation: pressSequentially (if fill was used) -> native setter.
+    let landed = await evalMain(ed, ({ msg }) => {
+      const el = document.querySelector('#aiAgentInputEl');
+      return el ? String(el.value || '') : null;
+    }, { msg }).catch(() => null);
+    if (typeof landed === 'string' && landed.trim().length < Math.min(msg.trim().length, 10)) {
+      if (filledVia === 'fill') {
+        filledVia = 'sequential';
+        try {
+          const loc2 = ed.locator('#aiAgentInputEl').first();
+          await loc2.pressSequentially(msg.slice(0, W.maxChars), { delay: W.seqDelayMs, timeout: W.seqTimeoutMs });
+        } catch (e) {}
+        landed = await evalMain(ed, () => {
+          const el = document.querySelector('#aiAgentInputEl');
+          return el ? String(el.value || '') : null;
+        }).catch(() => null);
+      }
+    }
+    if (typeof landed === 'string' && landed.trim().length < Math.min(msg.trim().length, 10)) {
+      // Last resort: native prototype setter + input/change events, so
+      // framework-controlled composers accept the value (bench T2c).
+      await evalMain(ed, ({ msg }) => {
+        const el = document.querySelector('#aiAgentInputEl');
+        if (!el) return;
+        el.focus();
+        try {
+          const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+          if (desc && desc.set) desc.set.call(el, msg); else el.value = msg;
+        } catch (e) { el.value = msg; }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, { msg }).catch(() => {});
+    }
+    // Settle (live-editor finding: Send enables on the input event — give the
+    // framework a beat to flip `disabled` before the real click, instead of
+    // racing it). Best-effort: a still-disabled button falls through to the
+    // eval-click and Enter fallbacks below.
+    try {
+      await ed.waitForFunction(() => { const b = document.querySelector('#aiAgentSendBtn'); return !!(b && !b.disabled); }, null, { timeout: 3000 });
+    } catch (e) {}
+    // Click Send (real pointer click — synthetic el.click() can miss handlers).
+    try {
+      const btn = ed.locator('#aiAgentSendBtn').first();
+      await btn.waitFor({ state: 'visible', timeout: 10000 });
+      await btn.click({ timeout: 10000 });
+    } catch (e) {
+      const fb = await evalMain(ed, () => {
+        const b = document.querySelector('#aiAgentSendBtn');
+        if (!b) return { ok: false };
+        b.click();
+        return { ok: true };
+      }).catch(() => ({ ok: false }));
+      if (!fb || !fb.ok) {
+        return { ok: false, error: 'could not click #aiAgentSendBtn: ' + String((e && e.message) || e).slice(0, 200), stage: 'send', ms: Date.now() - t0 };
+      }
+    }
+    // Confirm the send registered: a REAL transition (observed text ->
+    // cleared, or a new message), never an input that was already empty.
+    // (Bench caught the phantom class: empty-on-arrival faking sent=true.)
+    let sent = false, enterTried = false;
+    const sawText = typeof landed === 'string' && landed.trim().length > 0;
+    {
+      const sT0 = Date.now();
+      while (Date.now() - sT0 < W.sendConfirmMs) {
+        const st = await evalMain(ed, () => {
+          const el = document.querySelector('#aiAgentInputEl');
+          const panel = document.querySelector('#aiAgentPanelEl');
+          return { valueLen: el ? String(el.value || '').length : -1, textLen: panel ? String(panel.innerText || '').length : 0 };
+        }).catch(() => null);
+        if (sawText && st && st.valueLen === 0) { sent = true; break; }
+        const tr = await this._readAiTranscript(ed, 50).catch(() => null);
+        if (tr && (tr.count || 0) > beforeCount) { sent = true; break; }
+        if (!enterTried && Date.now() - sT0 > W.enterFallbackAtMs) {
+          enterTried = true;
+          await evalMain(ed, () => {
+            const el = document.querySelector('#aiAgentInputEl');
+            if (!el) return;
+            el.focus();
+            for (const type of ['keydown', 'keypress', 'keyup']) {
+              el.dispatchEvent(new KeyboardEvent(type, { bubbles: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 }));
+            }
+          }).catch(() => {});
+        }
+        await this.page.waitForTimeout(700);
+      }
+    }
+    // Wait for the reply: new message(s) + agent back to idle.
+    const deadline = Date.now() + Math.min(Math.max(timeout || 0, 5000), 600000);
+    let lastCount = beforeCount, idleSince = null, lastStableText = null;
+    let transcript = await this._readAiTranscript(ed, limit);
+    while (Date.now() < deadline) {
+      this._touch();
+      const probe = await this._aiProbe(ed);
+      transcript = await this._readAiTranscript(ed, limit);
+      lastCount = transcript.count != null ? transcript.count : (transcript.messages || []).length;
+      const grew = lastCount > beforeCount;
+      const busy = !!(probe && probe.busyHint) || !!(probe && probe.sendDisabled);
+      const curLast = (transcript.messages && transcript.messages.length)
+        ? transcript.messages[transcript.messages.length - 1].text : '';
+      if (curLast !== lastStableText) { lastStableText = curLast; idleSince = Date.now(); }
+      if (grew && !busy && Date.now() - (idleSince || Date.now()) > W.stableMs) break; // settled
+      if (grew && !busy) { await this.page.waitForTimeout(W.stableMs); continue; }
+      await this.page.waitForTimeout(Math.min(Math.max(pollMs || 1000, 400), 5000));
+    }
+    const timedOut = Date.now() >= deadline;
+    const msgs = transcript.messages || [];
+    // Reply = everything appended since the baseline (usually [echo, answer]).
+    let reply = null;
+    if (msgs.length) {
+      if (beforeLast != null && msgs.length && (before.count || 0) > 0) {
+        // messages are capped to `limit`, so slice relative to the end.
+        const fresh = msgs.filter((m) => m.text.slice(0, 120) !== beforeLast);
+        reply = (fresh.length ? fresh : msgs).map((m) => '[' + m.role + '] ' + m.text).join('\n\n---\n\n') || null;
+      } else {
+        reply = msgs.map((m) => '[' + m.role + '] ' + m.text).join('\n\n---\n\n');
+      }
+    }
+    return {
+      ok: !timedOut, sent, timedOut,
+      stage: timedOut ? 'wait-timeout' : 'done',
+      reply, messages: msgs,
+      countBefore: beforeCount, countAfter: lastCount,
+      ms: Date.now() - t0,
+      ...(timedOut
+        ? { hint: 'the AI agent is still working (or its reply is long) — keep polling with perch_ai_read {limit} until busyHint is false, then read the tail' }
+        : {}),
+    };
+  }
+
+  // ---------------- liveness ----------------
+  // Cheap pong for setup wizards (the bridge's mcp.ping equivalent): answers
+  // with no browser, so Step 1 of any harness setup can prove the server is
+  // alive before spending ~3s on a perch_start Cloudflare ladder.
+  async ping() {
+    this._touch();
+    let ver = 'unknown';
+    try { ver = require('./package.json').version; } catch (e) {}
+    return { ok: true, pong: true, name: 'perch', version: ver, ts: Date.now(), running: !!this.page, generator: this.generator || null };
+  }
+
+  // Precise CDP-style composer probe (the bridge's chat.probe equivalent).
+  // Returns the matched selector, tag/placeholder/aria, exact bounding rect +
+  // center, viewport/DPR/scroll, visibility/enabled/zIndex, the send button's
+  // rect, up to 8 candidate composers, message count, url + generatorName.
+  // Read-only: never clicks, never types. Our exact #aiAgentInputEl /
+  // #aiAgentSendBtn ids are tried first; generic heuristics follow in case an
+  // editor build renames them (the lesson the bridge's CHAT_SELECTORS teach).
+  async aiProbe({ scrollIntoView = false } = {}) {
+    if (!this.page) throw new Error('call perch_start first');
+    this._touch();
+    const ed = await this._frame('editor');
+    const probe = await evalMain(ed, ({ scrollIntoView }) => {
+      const COMPOSER_SELS = [
+        '#aiAgentInputEl',
+        'textarea[placeholder*="essage" i]',
+        'textarea[placeholder*="ask" i]',
+        'textarea[placeholder*="cribe" i]',
+        'textarea[placeholder*="prompt" i]',
+        '[contenteditable="true"]',
+        'textarea',
+      ];
+      const SEND_SELS = [
+        '#aiAgentSendBtn',
+        'button[aria-label*="end" i]',
+        'button[title*="end" i]',
+        'button[type="submit"]',
+        '[data-testid*="send" i]',
+      ];
+      const MSG_SELS = ['[class*="message"]', '[class*="chat"]', '[class*="reply"]', '[class*="assistant"]', '[class*="conversation"]', '[class*="thread"]'];
+      const rectOf = (el) => {
+        const r = el.getBoundingClientRect();
+        return { x: r.x, y: r.y, left: r.left, top: r.top, width: r.width, height: r.height, centerX: r.left + r.width / 2, centerY: r.top + r.height / 2 };
+      };
+      const cands = [];
+      for (const s of COMPOSER_SELS) {
+        let els = [];
+        try { els = [...document.querySelectorAll(s)]; } catch (e) { continue; }
+        for (const el of els) {
+          const r = rectOf(el);
+          cands.push({
+            selector: s, tag: (el.tagName || '').toLowerCase(),
+            placeholder: (el.getAttribute && el.getAttribute('placeholder')) || '',
+            aria: (el.getAttribute && el.getAttribute('aria-label')) || '',
+            rect: r, visible: r.width > 0 && r.height > 0,
+          });
+          if (cands.length >= 8) break;
+        }
+        if (cands.length >= 8) break;
+      }
+      const url = (() => { try { return location.href; } catch (e) { return ''; } })();
+      const generatorName = (() => { try { return (location.pathname || '').split('/').filter(Boolean).pop() || ''; } catch (e) { return ''; } })();
+      let composer = null, csel = '';
+      for (const s of COMPOSER_SELS) {
+        let el = null;
+        try { el = document.querySelector(s); } catch (e) { el = null; }
+        if (el) { composer = el; csel = s; break; }
+      }
+      if (!composer) return { ok: false, e: 'no composer found', candidates: cands, url, generatorName };
+      if (scrollIntoView) { try { composer.scrollIntoView({ block: 'center' }); } catch (e) {} }
+      const r = rectOf(composer);
+      let cs = null;
+      try { cs = getComputedStyle(composer); } catch (e) { cs = null; }
+      let sendEl = null, sendSel = '';
+      for (const s of SEND_SELS) {
+        let el = null;
+        try { el = document.querySelector(s); } catch (e) { el = null; }
+        if (el) { sendEl = el; sendSel = s; break; }
+      }
+      let messageCount = 0;
+      try {
+        const all = [];
+        for (const s of MSG_SELS) { try { for (const el of document.querySelectorAll(s)) all.push(el); } catch (e2) {} }
+        messageCount = all.length;
+      } catch (e) {}
+      return {
+        ok: true,
+        composer: {
+          selector: csel, tag: (composer.tagName || '').toLowerCase(),
+          placeholder: (composer.getAttribute && composer.getAttribute('placeholder')) || '',
+          aria: (composer.getAttribute && composer.getAttribute('aria-label')) || '',
+          rect: r, visible: r.width > 0 && r.height > 0, enabled: !composer.disabled,
+          inViewport: r.bottom > 0 && r.top < (window.innerHeight || 0) && r.right > 0 && r.left < (window.innerWidth || 0),
+          display: cs ? cs.display : '', visibility: cs ? cs.visibility : '', opacity: cs ? cs.opacity : '', zIndex: cs ? cs.zIndex : '',
+        },
+        sendButton: sendEl ? { selector: sendSel, rect: rectOf(sendEl) } : null,
+        candidates: cands.slice(0, 8), messageCount,
+        viewport: { w: window.innerWidth, h: window.innerHeight }, devicePixelRatio: window.devicePixelRatio || 1,
+        scroll: { x: window.scrollX, y: window.scrollY },
+        url, generatorName,
+      };
+    }, { scrollIntoView: !!scrollIntoView }).catch((e) => ({ ok: false, e: String((e && e.message) || e) }));
+    if (!probe || probe.ok !== true) {
+      return { ok: false, via: 'playwright-eval', error: (probe && (probe.e || probe.error)) || 'probe failed', candidates: (probe && probe.candidates) || [], url: (probe && probe.url) || '', generatorName: (probe && probe.generatorName) || '' };
+    }
+    return { ok: true, via: 'playwright-eval', probe };
+  }
+
+  // Lightweight chat link state (the bridge's chat.status equivalent): one
+  // eval, no transcript, never clicks. Poll this after a wake failure before
+  // paying for the full perch_ai_probe rect walk or perch_ai_read transcript.
+  async aiStatus() {
+    if (!this.page) throw new Error('call perch_start first');
+    this._touch();
+    const ed = await this._frame('editor');
+    const probe = await this._aiProbe(ed);
+    if (probe.probeError) return { ok: false, error: probe.probeError };
+    return {
+      ok: true, via: 'playwright-eval',
+      composer: !!probe.inputVisible,
+      generatorFrame: true,
+      panelVisible: !!probe.panelVisible,
+      inputVisible: !!probe.inputVisible,
+      inputEnabled: !!probe.inputEnabled,
+      sendVisible: !!probe.sendVisible,
+      sendEnabled: !!probe.sendEnabled,
+      busyHint: !!probe.busyHint,
+      messageCount: probe.messageCount != null ? probe.messageCount : null,
+      url: probe.url || '', generatorName: probe.generatorName || '',
+    };
+  }
+
+  // Connection doctor (the bridge's buildDoctor/statusJSON pattern): one JSON
+  // plus one plain-language sentence naming the FIRST broken link and the one
+  // call that fixes it. Works with no session. Check order is the pipeline
+  // order: session -> cloudflare -> docs -> preview -> AI chat.
+  async doctor() {
+    const t0 = Date.now();
+    if (!this.page) {
+      return {
+        ok: false, started: false, ms: Date.now() - t0,
+        summary: 'No editor session — nothing is running yet.',
+        nextAction: 'Call perch_start {name} (add collabKey when editing a shared room).',
+        checks: {
+          session: { started: false },
+          docs: null, preview: null, cloudflare: null, aiChat: null,
+          idle: { msSinceLastCall: Date.now() - this.last },
+        },
+      };
+    }
+    this._touch();
+    const ed = await this._frame('editor');
+    const st = await this.status().catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    const probe = await this._aiProbe(ed).catch((e) => ({ probeError: String((e && e.message) || e) }));
+    let aiCount = null;
+    try {
+      const tr = await this._readAiTranscript(ed, 1);
+      aiCount = tr.count != null ? tr.count : null;
+    } catch (e) { aiCount = null; }
+    const docsReady = !!(st && st.hasOutputView && st.hasModelView);
+    const cfBlocked = !!(st && st.cfBlocked);
+    const preview = (st && st.preview) || null;
+    const previewHealthy = !!(preview && preview.healthy);
+    const previewDead = !!(preview && preview.found && !preview.healthy);
+    const aiReady = !!(probe && probe.inputVisible && probe.sendVisible && probe.sendEnabled);
+    const aiBusy = !!(probe && probe.busyHint);
+    const checks = {
+      session: { started: true, generator: this.generator || null, engine: this.engine, effectiveEngine: this.effectiveEngine || this.engine, headed: this.headed },
+      docs: { ready: docsReady, hasOutputView: !!(st && st.hasOutputView), hasModelView: !!(st && st.hasModelView), saveState: (st && st.saveState) || null, syntaxErrors: (st && st.syntaxErrors) || null, modelLines: (st && st.modelLines) || null, outputLines: (st && st.outputLines) || null },
+      preview: preview ? { healthy: previewHealthy, booted: !!preview.booted, loaderError: !!preview.loaderError, text: (preview.text || '').slice(0, 120) } : { healthy: null, note: 'no preview frame yet' },
+      cloudflare: { blocked: cfBlocked },
+      aiChat: { ready: aiReady, busy: aiBusy, inputVisible: !!(probe && probe.inputVisible), sendEnabled: !!(probe && probe.sendEnabled), messageCount: aiCount, url: (probe && probe.url) || '' },
+      idle: { msSinceLastCall: Date.now() - this.last, autoCloseMs: IDLE_MS },
+    };
+    let summary, nextAction, ok;
+    if (cfBlocked) {
+      ok = false;
+      summary = 'Cloudflare challenge is blocking the editor page.';
+      nextAction = 'Call perch_start again (it auto-escalates: fresh context → relaunch → headed → next engine).';
+    } else if (!docsReady) {
+      ok = false;
+      summary = 'Editor docs are not ready (views or content missing).';
+      nextAction = 'Call perch_start again (add force:true to reload); if the page looks blank, wait ~40s and re-check perch_status.';
+    } else if (previewDead) {
+      ok = false;
+      summary = 'Editor is fine but the generator preview never booted' + (preview && preview.loaderError ? ' (its file loader did not become available).' : '.');
+      nextAction = 'Call perch_start {force:true} once; if it persists, retry with engineChain starting at another engine (firefox → chrome → chromium).';
+    } else if (!aiReady) {
+      ok = false;
+      summary = 'Editor + preview are healthy, but the built-in AI chatbox is not visible (the shared panel is probably on the files view).';
+      nextAction = 'Call perch_ai_wake {} (re-opens the AI tab), then perch_ai_probe {} if it still fails.';
+    } else if (aiBusy) {
+      ok = true;
+      summary = 'All green, and the AI helper is currently working — do not send yet.';
+      nextAction = 'Poll perch_ai_read {limit} until busyHint is false, then read the tail (or send with perch_ai_ask, which waits for idle first).';
+    } else {
+      ok = true;
+      summary = 'All green — session, docs, preview and AI chat are ready.';
+      nextAction = 'None needed. Send work with perch_ai_ask, or edit directly with perch_patch and verify with perch_errors.';
+    }
+    return { ok, summary, nextAction, checks, ms: Date.now() - t0 };
+  }
+
+  // Zip backup (the bridge's DownloadsPlugin / Kilo-export pattern): a
+  // byte-exact snapshot of main.pjs + index.html + every src/* file the
+  // public manifest lists, as one STORE zip (no compression, no new deps).
+  // Browser-free and collab-safe: it reads the last OWNER save via the public
+  // API, never the live room. Take one before any risky whole-pane rewrite.
+  async exportZip({ name = null, dir = null, outPath = null } = {}) {
+    const t0 = Date.now();
+    const gen = name || this.generator;
+    if (!gen) throw new Error('no generator — pass name or call perch_start first');
+    this._touch();
+    const g = this.apiData({ name: gen });
+    const model = g.modelText || '';
+    const html = g.outputTemplate || '';
+    if (!model && !html) return { ok: false, error: 'public API returned no source for "' + gen + '"' };
+    const manifest = (g.srcManifest && typeof g.srcManifest === 'object') ? g.srcManifest : {};
+    const files = [
+      { name: 'main.pjs', data: Buffer.from(model, 'utf8') },
+      { name: 'index.html', data: Buffer.from(html, 'utf8') },
+    ];
+    const srcErrors = [];
+    const keys = Object.keys(manifest).slice(0, 1000);
+    for (const p of keys) {
+      const key = manifest[p] && manifest[p].key;
+      if (!key) { srcErrors.push(p + ': no CDN key'); continue; }
+      try {
+        const buf = this._curlBuffer('https://user.uploads.dev/file/' + key);
+        if (!buf || !buf.length) { srcErrors.push(p + ': empty body'); continue; }
+        if (buf.length > 25 * 1024 * 1024) { srcErrors.push(p + ': over 25 MB, skipped'); continue; }
+        files.push({ name: 'src/' + p, data: buf });
+      } catch (e) { srcErrors.push(p + ': ' + String((e && e.message) || e).slice(0, 120)); }
+    }
+    const totalBytes = files.reduce((a, f) => a + f.data.length, 0);
+    if (totalBytes > 100 * 1024 * 1024) return { ok: false, error: 'workspace too large for a zip export (' + totalBytes + ' bytes > 100 MB)' };
+    const zip = _buildStoreZip(files);
+    const out = outPath || path.join(dir || path.join(MIRROR_ROOT, gen), gen + '.zip');
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, zip);
+    return {
+      ok: true, generator: gen, path: out, bytes: zip.length, ms: Date.now() - t0,
+      entries: files.map((f) => ({ name: f.name, size: f.data.length })),
+      srcFiles: files.length - 2, srcErrors: srcErrors.slice(0, 20),
+      hint: 'Byte-exact snapshot (STORE zip, no compression). Re-import with perch_write_file per pane + perch_upload_src per src file.',
+    };
+  }
+
+  // ---------------- offline agent shelf (browser-free continuity) ----------------
+  // Ports of the bridge generator's src/shelf.js impls, file-backed under
+  // .perch-shelf/shelf.json so think/memory/todo state survives the ~20 min
+  // browser idle-close, compaction, and sessions that never call perch_start.
+  async think({ thought, next = null } = {}) {
+    if (!thought || !String(thought).trim()) return { ok: false, error: 'thought is required' };
+    this._touch();
+    const s = _shelfLoad();
+    s.thoughts.push(String(thought).slice(0, 800));
+    const total = s.thoughts.length;
+    _shelfSave({ mem: s.mem, thoughts: s.thoughts.slice(-50), todos: s.todos });
+    return { ok: true, step: total, total, ...(next ? { next: String(next).slice(0, 200) } : {}) };
+  }
+
+  async memory({ action, entity = null, observation = null, query = null } = {}) {
+    const a = String(action || '').toLowerCase();
+    if (!['remember', 'recall', 'forget'].includes(a)) return { ok: false, error: 'action must be remember|recall|forget' };
+    this._touch();
+    const s = _shelfLoad();
+    if (a === 'remember') {
+      if (!entity || !observation) return { ok: false, error: 'remember needs {entity, observation}' };
+      const k = String(entity).slice(0, 80);
+      (s.mem[k] = s.mem[k] || []).push(String(observation).slice(0, 500));
+      _shelfSave(s);
+      return { ok: true, action: a, entity: k, facts: s.mem[k].length };
+    }
+    if (a === 'recall') {
+      const q = String(query || '').toLowerCase();
+      const out = [];
+      for (const k of Object.keys(s.mem)) {
+        const hits = s.mem[k].filter((o) => !q || o.toLowerCase().includes(q) || k.toLowerCase().includes(q));
+        if (hits.length) out.push({ entity: k, facts: hits });
+      }
+      return { ok: true, action: a, query: query || null, entities: out.length, results: out.slice(0, 50) };
+    }
+    if (!entity) {
+      const n = Object.keys(s.mem).length;
+      s.mem = {};
+      _shelfSave(s);
+      return { ok: true, action: a, erasedEntities: n };
+    }
+    delete s.mem[String(entity)];
+    _shelfSave(s);
+    return { ok: true, action: a, entity: String(entity) };
+  }
+
+  async todo({ action, text = null, id = null } = {}) {
+    const a = String(action || '').toLowerCase();
+    if (!['add', 'list', 'done', 'clear'].includes(a)) return { ok: false, error: 'action must be add|list|done|clear' };
+    this._touch();
+    const s = _shelfLoad();
+    if (a === 'add') {
+      if (!text || !String(text).trim()) return { ok: false, error: 'add needs {text}' };
+      const item = { id: 't' + Date.now().toString(36), text: String(text).slice(0, 300), done: false };
+      s.todos.push(item);
+      _shelfSave(s);
+      return { ok: true, action: a, item, total: s.todos.length };
+    }
+    if (a === 'list') {
+      return { ok: true, action: a, total: s.todos.length, open: s.todos.filter((t) => !t.done).length, items: s.todos.slice(-100) };
+    }
+    if (a === 'done') {
+      if (!id) return { ok: false, error: 'done needs {id}' };
+      const t = s.todos.find((x) => x.id === id || (id && x.id.endsWith(id)));
+      if (!t) return { ok: false, error: 'todo not found: ' + id, total: s.todos.length };
+      t.done = true;
+      _shelfSave(s);
+      return { ok: true, action: a, item: t };
+    }
+    const n = s.todos.length;
+    s.todos = [];
+    _shelfSave(s);
+    return { ok: true, action: a, cleared: n };
+  }
+
+  async clock({ timezone = 'UTC' } = {}) {
+    const tz = String(timezone || 'UTC');
+    try {
+      const now = new Date();
+      const display = new Intl.DateTimeFormat('en-GB', { timeZone: tz, dateStyle: 'full', timeStyle: 'long' }).format(now);
+      return { ok: true, timezone: tz, iso: now.toISOString(), display: now.toString() + ' | ' + tz + ': ' + display };
+    } catch (e) {
+      return { ok: false, error: 'bad timezone "' + tz + '" — use an IANA zone like UTC or America/New_York', iso: new Date().toISOString() };
+    }
+  }
+
+  async calc({ expr } = {}) {
+    if (expr == null || !String(expr).trim()) return { ok: false, error: 'expr is required' };
+    const r = _calcSafe(expr);
+    if (r.error) return { ok: false, error: r.error, expr: String(expr).slice(0, 200) };
+    return { ok: true, expr: String(expr).slice(0, 200), result: r.value };
+  }
+
+  // Worker-style JS without a browser: runs inside Node's vm sandbox with a
+  // wall-clock timeout. User-code throws and timeouts come back as ok:true
+  // tool output (like the bridge shelf) so the agent sees them as results;
+  // only tool misuse (no code, too long) is ok:false.
+  async runJs({ code, timeoutMs = 5000 } = {}) {
+    const src = String(code == null ? '' : code);
+    if (!src.trim()) return { ok: false, error: 'code is required' };
+    if (src.length > 4000) return { ok: false, error: 'code too long (' + src.length + ' chars, max 4000)' };
+    const t = Math.min(Math.max(+timeoutMs || 5000, 100), 10000);
+    this._touch();
+    try {
+      const vm = require('vm');
+      const out = vm.runInNewContext('"use strict";' + src, {}, { timeout: t });
+      const text = out === undefined ? '(undefined)' : String(out);
+      return { ok: true, result: text.slice(0, 4000) };
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (/timed out/i.test(msg)) return { ok: true, result: 'timeout after ' + t + 'ms', timedOut: true };
+      return { ok: true, result: 'error: ' + msg.slice(0, 500) };
+    }
+  }
+
+  async webFetch({ url, maxChars = 8000 } = {}) {
+    if (!url || !/^https?:\/\//i.test(String(url))) return { ok: false, error: 'url must be a full https:// URL' };
+    const max = Math.min(Math.max(+maxChars || 8000, 500), 20000);
+    this._touch();
+    try {
+      const stripped = _stripHtml(this._curlText(String(url)));
+      return { ok: true, url: String(url), chars: Math.min(stripped.length, max), truncated: stripped.length > max, text: stripped.slice(0, max) || '(empty page)' };
+    } catch (e) {
+      return { ok: false, error: 'fetch failed: ' + String((e && e.message) || e).slice(0, 200), url: String(url) };
+    }
+  }
+
+  async webSearch({ query, n = 5 } = {}) {
+    const q = String(query || '').trim();
+    if (!q) return { ok: false, error: 'query is required' };
+    const count = Math.min(Math.max(+n || 5, 1), 10);
+    this._touch();
+    const results = [];
+    try {
+      const raw = this._curlText('https://api.duckduckgo.com/?q=' + encodeURIComponent(q) + '&format=json&no_html=1&skip_disambig=1');
+      const j = JSON.parse(raw);
+      if (j.Abstract) results.push({ source: 'ddg', text: String(j.Abstract).slice(0, 600), url: j.AbstractURL || null });
+      for (const t of (j.RelatedTopics || []).slice(0, count)) {
+        const u = t.FirstURL || (t.Topics && t.Topics[0] && t.Topics[0].FirstURL) || null;
+        if (t.Text) results.push({ source: 'ddg', text: String(t.Text).slice(0, 220), url: u });
+        if (results.length >= count + 1) break;
+      }
+    } catch (e) {}
+    try {
+      const raw2 = this._curlText('https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=' + encodeURIComponent(q) + '&format=json&origin=*&srlimit=' + count);
+      const j2 = JSON.parse(raw2);
+      for (const s of ((j2.query && j2.query.search) || [])) {
+        results.push({ source: 'wiki', text: s.title, url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(String(s.title).replace(/ /g, '_')) });
+      }
+    } catch (e) {}
+    const text = results.map((r) => '- ' + r.text + (r.url ? ' ' + r.url : '')).join('\n').slice(0, 4000);
+    return { ok: true, query: q, count: results.length, results: results.slice(0, 20), text: text || '(no results)' };
+  }
+
+  // Static skill catalog (the bridge's skill.list equivalent): the 13 agent
+  // skill ids with titles and one-line descriptions. Browser-free. To load
+  // one into the AI helper: perch_ai_ask {text: "load the skill <id> and
+  // follow it for this task"}.
+  async skills() {
+    return { ok: true, count: SKILLS.length, skills: SKILLS.map((s) => ({ id: s.id, title: s.title, description: s.description, prompt: 'skills.' + s.id })) };
   }
 
   async stop() {

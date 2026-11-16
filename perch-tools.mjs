@@ -28,6 +28,8 @@ export const TOOLS = [
         width: { type: "integer", description: "Viewport width. Default 1500" },
         height: { type: "integer", description: "Viewport height. Default 950" },
         force: { type: "boolean", description: "Reload even if already on this generator" },
+        persistProfile: { type: "boolean", description: "Keep ONE browser profile dir across starts (launchPersistentContext) so the editor's localStorage client id and AI chat history survive restarts. Default false (fresh profile each start). First use creates .perch-profile under the server's working directory" },
+        profileDir: { type: "string", description: "Profile dir for persistProfile (or PERCH_PROFILE_DIR env). Default .perch-profile" },
       },
       required: ["name"],
     },
@@ -388,6 +390,185 @@ export const TOOLS = [
       required: ["path"],
     },
   },
+  {
+    name: "perch_ai_wake",
+    description: "WAKE the editor's built-in AI coding agent: ensure its shared side panel (#aiAgentPanelEl) is back on the chat view and its only inputs — <textarea id=\"aiAgentInputEl\"> + <button id=\"aiAgentSendBtn\"> — are visible and enabled. Call this before perch_ai_ask, and after perch_upload_src/perch_delete_src (those leave the panel on the files view). Returns readiness flags plus the recent transcript tail.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeout: { type: "integer", description: "ms to keep hunting for the AI tab. Default 15000" },
+        limit: { type: "integer", description: "Transcript messages to return. Default 10" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "perch_ai_ask",
+    description: "Talk to the editor's built-in AI coding agent through its ONLY access — fill #aiAgentInputEl and click #aiAgentSendBtn — then wait for the reply and return it. Auto-wakes the panel first (same as perch_ai_wake). Long edits can take minutes: on a wait-timeout (ok:false, timedOut:true) keep polling with perch_ai_read until busyHint is false. This is how an outside coding agent delegates to the Perchance AI helper.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Message to send to the AI helper, e.g. 'add a score counter to the game'" },
+        timeout: { type: "integer", description: "ms to wait for the reply. Default 180000, max 600000" },
+        pollMs: { type: "integer", description: "Poll interval while waiting. Default 1000" },
+        waitIdleMs: { type: "integer", description: "ms to wait for a previous AI task to finish before sending. Default 30000" },
+        limit: { type: "integer", description: "Transcript messages to return. Default 20" },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "perch_ai_read",
+    description: "Read-only transcript of the built-in AI helper: chatbox state (#aiAgentInputEl/#aiAgentSendBtn visible+enabled, busyHint) plus the last messages. Never clicks anything — safe to poll after a perch_ai_ask timeout while the agent is still working.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max messages. Default 20" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "perch_ping",
+    description: "Cheap liveness pong — answers with no browser and no session (setup Step 1). Proves the server is alive before spending ~3s on a perch_start Cloudflare ladder.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "perch_ai_probe",
+    description: "Precise CDP-style probe of the editor AI chat composer: matched selector, tag/placeholder/aria, exact bounding rect + center, viewport/DPR/scroll, visibility/enabled/zIndex, send-button rect, up to 8 candidate composers, message count, url + generatorName. Read-only — never clicks or types. Run this when perch_ai_wake fails (an editor rebuild may have moved the chatbox).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scrollIntoView: { type: "boolean", description: "Scroll the composer into view before measuring. Default false" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "perch_ai_status",
+    description: "Lightweight chat link state: composer found, panel/input/send visible+enabled, busyHint, message count, url. One eval, no transcript, never clicks — cheaper than perch_ai_read for polling whether a send is possible.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "perch_doctor",
+    description: "Connection doctor: one JSON plus one plain-language sentence naming the FIRST broken link (session → Cloudflare → docs → preview → AI chat) and the one call that fixes it. Works with no session. Call this when anything looks wrong instead of guessing.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "perch_export",
+    description: "Zip backup: byte-exact snapshot of main.pjs + index.html + every src/* file the public manifest lists, as one STORE zip (no compression, no new deps). Browser-free and collab-safe — reads the last OWNER save via the public API, never the live room. Take one before any risky whole-pane rewrite.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Generator name. Defaults to the current session generator" },
+        dir: { type: "string", description: "Output directory. Default <perch dir>/.perch-mirror/<name>" },
+        outPath: { type: "string", description: "Exact output .zip path. Default <dir>/<name>.zip" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "perch_think",
+    description: "Structured reasoning scratchpad (offline, browser-free). Logs a thought to the file-backed shelf (.perch-shelf/shelf.json — survives the ~20 min browser idle-close); returns the step count.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thought: { type: "string", description: "Reasoning step" },
+        next: { type: "string", description: "What to do next (optional)" },
+      },
+      required: ["thought"],
+    },
+  },
+  {
+    name: "perch_memory",
+    description: "Durable memory (offline, browser-free, file-backed). remember needs {entity, observation}; recall takes an optional {query} (empty = all); forget with an {entity} erases it, without erases all.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["remember", "recall", "forget"] },
+        entity: { type: "string", description: "Who/what this is about" },
+        observation: { type: "string", description: "Fact to store (remember only)" },
+        query: { type: "string", description: "Search words (recall only, empty = all)" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "perch_todo",
+    description: "Task board (offline, browser-free, file-backed). add needs {text}; list shows all; done needs {id} (suffix match ok); clear empties the board.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["add", "list", "done", "clear"] },
+        text: { type: "string", description: "Task text (add only)" },
+        id: { type: "string", description: "Task id (done only)" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "perch_clock",
+    description: "Current date/time with timezone support (offline, browser-free).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timezone: { type: "string", description: "IANA zone, e.g. UTC or America/New_York. Default UTC" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "perch_calc",
+    description: "Safe calculator (offline, browser-free). Numbers, +-*/().,%,^ and Math names only (sqrt/sin/cos/log aliases) — no variables, no function definitions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        expr: { type: "string", description: "e.g. (12*7+3)/4 or sqrt(2)^2" },
+      },
+      required: ["expr"],
+    },
+  },
+  {
+    name: "perch_run_js",
+    description: "Run a short sync JS snippet in a Node vm sandbox with a wall-clock timeout (offline, browser-free). User-code throws and timeouts come back as ok:true tool output so the agent sees them as results.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "Sync JS; `return` supported. Max 4000 chars" },
+        timeoutMs: { type: "integer", description: "Wall-clock cap ms (100–10000). Default 5000" },
+      },
+      required: ["code"],
+    },
+  },
+  {
+    name: "perch_web_fetch",
+    description: "Fetch a page (browser-free, via curl) as readable text: scripts/styles stripped, HTML entities decoded, capped at maxChars.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Full https:// URL" },
+        maxChars: { type: "integer", description: "Max chars (500–20000). Default 8000" },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "perch_web_search",
+    description: "Keyless search (browser-free): DuckDuckGo instant + Wikipedia, merged and capped.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search terms" },
+        n: { type: "integer", description: "Max per-source results (1–10). Default 5" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "perch_skills",
+    description: "List the 13 agent skill ids (ai-text-plugin, server-plugin, …) with one-line descriptions. Browser-free. To load one into the AI helper: perch_ai_ask {text: 'load the skill <id> and follow it for this task'}.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
 ];
 
 // ----------------------------- dispatch -----------------------------
@@ -422,4 +603,21 @@ export const DISPATCH = {
   perch_navigate: (a) => session.navigate(a),
   perch_upload_src: (a) => session.uploadSrc(a),
   perch_delete_src: (a) => session.deleteSrc(a),
+  perch_ai_wake: (a) => session.aiWake(a),
+  perch_ai_ask: (a) => session.aiAsk(a),
+  perch_ai_read: (a) => session.aiRead(a),
+  perch_ping: () => session.ping(),
+  perch_ai_probe: (a) => session.aiProbe(a),
+  perch_ai_status: () => session.aiStatus(),
+  perch_doctor: () => session.doctor(),
+  perch_export: (a) => session.exportZip(a),
+  perch_think: (a) => session.think(a),
+  perch_memory: (a) => session.memory(a),
+  perch_todo: (a) => session.todo(a),
+  perch_clock: (a) => session.clock(a),
+  perch_calc: (a) => session.calc(a),
+  perch_run_js: (a) => session.runJs(a),
+  perch_web_fetch: (a) => session.webFetch(a),
+  perch_web_search: (a) => session.webSearch(a),
+  perch_skills: () => session.skills(),
 };

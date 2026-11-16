@@ -2,16 +2,17 @@
 
 An MCP server that gives an AI agent real, bidirectional control of a
 [Perchance.org](https://perchance.org) generator: read its source, edit it,
-drive its live UI, and read its console — all through 29 tools over stdio,
-speaking the current MCP specification (`2026-07-28`, the stateless "v2"
-protocol).
+drive its live UI, read its console, wake the built-in AI helper, diagnose
+the pipeline, back up the workspace, and keep offline agent state — all
+through 47 tools over stdio, speaking the current MCP specification
+(`2026-07-28`, the stateless "v2" protocol).
 
 Two distinct code paths, deliberately:
 
 | Path | Tools | Cost | Cloudflare |
 |---|---|---|---|
 | **Browser-free** | `perch_pull`, `perch_fetch_generator`, `perch_src`, `perch_list_src` | ~1s | none — uses `curl` |
-| **Live editor** | `perch_start` + the other 25 | ~2.7s start, then 1–20ms/call | mitigated |
+| **Live editor** | `perch_start` + the other 43 | ~2.7s start, then 1–20ms/call | mitigated |
 
 Reads should almost always use the browser-free path. The browser exists for
 edits, `eval`, and UI testing.
@@ -89,7 +90,7 @@ hermes mcp add perch \
   --args "/absolute/path/to/perchance-editor-mcp/perch-mcp.mjs"
 ```
 
-Answer `y` to *"Enable all 29 tools?"*, then start a new session or run
+Answer `y` to *"Enable all 47 tools?"*, then start a new session or run
 `/reload-mcp` in an open one. Confirm with `hermes mcp test perch`. The tools
 arrive namespaced as `mcp__perch__perch_pull`, `mcp__perch__perch_start`, …
 
@@ -131,7 +132,7 @@ if you want to skip the failed handshake attempt entirely.
 
 The client must support MCP `2026-07-28` (or a modern-era SDK that negotiates
 via `server/discover`). For a legacy-handshake-only client, point it at
-`perch-mcp-legacy.mjs` instead — the same 29 tools and perch-core fixes behind
+`perch-mcp-legacy.mjs` instead — the same 47 tools and perch-core fixes behind
 the classic initialize/`tools/list`/`tools/call` flow (protocol `2025-11-25`
 and earlier; no `_meta` envelope required), shipped since tag
 [`v1.2.0`](https://github.com/Nightomaru/perchance-editor-mcp/releases/tag/v1.2.0).
@@ -176,16 +177,37 @@ Full recipe, collab/publish semantics, and the Cloudflare ladder:
 
 ## The tool set
 
-29 tools. All return JSON with an `ok` boolean and an `ms` timing field.
+47 tools. All return JSON with an `ok` boolean and an `ms` timing field.
 
 | Group | Tools |
 | --- | --- |
 | **Browser-free** (no session) | `perch_pull`, `perch_fetch_generator`, `perch_src`, `perch_list_src` |
-| **Session** | `perch_start`, `perch_status`, `perch_stop` |
+| **Session** | `perch_start`, `perch_status`, `perch_stop`, `perch_ping` |
+| **Diagnosis** | `perch_doctor` |
+| **Built-in AI helper** | `perch_ai_wake`, `perch_ai_ask`, `perch_ai_read`, `perch_ai_probe`, `perch_ai_status` |
+| **Backup** | `perch_export` |
+| **Agent shelf** (offline, no session) | `perch_think`, `perch_memory`, `perch_todo`, `perch_clock`, `perch_calc`, `perch_run_js`, `perch_web_fetch`, `perch_web_search` |
+| **Skills** | `perch_skills` |
 | **Recovery / src files** | `perch_navigate`, `perch_upload_src`, `perch_delete_src` |
 | **Reading** (live) | `perch_read`, `perch_grep`, `perch_outline`, `perch_console`, `perch_errors`, `perch_snapshot` |
 | **Writing** (live) | `perch_patch`, `perch_edit`, `perch_write`, `perch_write_file`, `perch_copy_lines` |
 | **Preview / UI** | `perch_refresh`, `perch_eval`, `perch_wait`, `perch_click`, `perch_type`, `perch_press`, `perch_set_viewport`, `perch_shot` |
+
+Built-in AI helper: the editor's integrated coding agent has no API — only its
+chatbox (`#aiAgentInputEl` + `#aiAgentSendBtn` inside `#aiAgentPanelEl`).
+`perch_ai_wake` brings that chat view back (the files view hides it),
+`perch_ai_ask` sends a message and waits for the reply, `perch_ai_read` polls
+the transcript while it works, `perch_ai_probe` returns the precise composer
+rect + candidates when the chatbox moves, and `perch_ai_status` is the cheap
+one-eval link check. Send escalation inside `ask` is click, eval-click, then a
+single Enter key (all timings centralized in `PerchSession.AI_WAKE`). This is how an outside coding agent delegates
+to the Perchance AI helper over MCP. When anything looks wrong, call
+`perch_doctor` first — it names the first broken link and the one call that
+fixes it. `perch_export` zips a byte-exact backup before risky rewrites; the
+agent shelf (`think`/`memory`/`todo`/`clock`/`calc`/`run_js`/`web_*`) keeps
+offline state that survives the ~20 min browser idle-close. `perch_start`
+takes `persistProfile: true` to keep one browser profile dir across starts,
+preserving the editor's agent identity and chat history.
 
 Per-tool purpose and arguments — plus the `perch_start` argument table — are in
 [`SKILL.md`](SKILL.md).

@@ -15,6 +15,17 @@
 //                        the live preview with usable CSS selectors.
 //   * perch_wait       — wait for a selector/text to appear or vanish.
 //   * perch_errors     — syntax errors + buffered console/runtime errors.
+//   * perch_ai_wake/ask/read — bridge to the editor's BUILT-IN AI coding
+//                        agent through its only access: fill
+//                        #aiAgentInputEl + click #aiAgentSendBtn, then wait
+//                        for and harvest the reply (auto-wakes the shared
+//                        #aiAgentPanelEl off the files view).
+//   * perch_ai_probe/status — precise composer probe (rects/candidates) +
+//                        lightweight link state; perch_doctor — first-broken-
+//                        link diagnosis; perch_export — STORE zip backup.
+//   * perch_think/memory/todo/clock/calc/run_js/web_fetch/web_search —
+//                        offline file-backed agent shelf (no browser needed);
+//                        perch_skills — the 13 agent skill ids; perch_ping.
 //   * start.engine     — 'firefox' (DEFAULT; clears CF on perchance.org
 //     subdomains) | 'chromium' (escape hatch / automatic fallback).
 //   * preview-frame resolution that makes eval/click/type/shot all work.
@@ -29,7 +40,7 @@ const FRAME = { type: "string", enum: ["preview", "editor"] };
 
 // ----------------------------- server factory (MCP v2) -----------------------------
 function createServer() {
-  const server = new McpServer({ name: "perch", version: "2.3.3" }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: "perch", version: "2.8.0" }, { capabilities: { tools: {} } });
   for (const tool of TOOLS) {
     server.registerTool(
       tool.name,

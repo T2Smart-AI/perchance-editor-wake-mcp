@@ -1,6 +1,6 @@
 {
   "name": "perch-mcp-v2",
-  "version": "2.4.0",
+  "version": "2.8.0",
   "description": "MCP v2 (2026-07-28 stateless) server: read/write control of a Perchance.org generator's live editor. Default engine: playwright firefox; optional chromium / patchright fallbacks.",
   "type": "commonjs",
   "main": "perch-mcp.mjs",
@@ -14,7 +14,8 @@
   "scripts": {
     "start": "node perch-mcp.mjs",
     "test:core": "node test/smoke-core.mjs",
-    "test:mcp": "node test/smoke-mcp.mjs"
+    "test:mcp": "node test/smoke-mcp.mjs",
+    "test:persist": "node test/persist-profile.smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.1.1",
