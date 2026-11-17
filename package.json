@@ -14,8 +14,7 @@
   "scripts": {
     "start": "node perch-mcp.mjs",
     "test:core": "node test/smoke-core.mjs",
-    "test:mcp": "node test/smoke-mcp.mjs",
-    "test:persist": "node test/persist-profile.smoke.mjs"
+    "test:mcp": "node test/smoke-mcp.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.1.1",
