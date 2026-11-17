@@ -2,7 +2,7 @@
 name: perchance-editor
 description: Read, patch, and live-test Perchance generators over MCP.
 version: 2.8.0
-author: Nightomaru
+author: T2Smart-AI (forked from Nightomaru)
 license: MIT
 ---
 
@@ -126,18 +126,6 @@ before anything else — it needs no session and checks the chain in order
 (session → generator docs → preview → Cloudflare → AI chat → idle timeout),
 returning the first broken link plus a concrete `nextAction`. `perch_ping` is
 the even cheaper liveness check (server up, no session required).
-
-**Persistence.** The editor identifies the agent per browser profile
-(`localStorage perchanceEditorClientId`). The default fresh profile rotates
-that id on every start and wipes chat history — pass
-`perch_start {persistProfile: true}` to keep ONE profile dir
-(`.perch-profile`, or `profileDir`/`PERCH_PROFILE_DIR`) across restarts.
-Never clear the profile's site data while persistence matters. Switch
-engines or the profile flag forces a relaunch; the start result reports the
-active `profile`. `_ensureAiPanel` waits for the lazily injected composer
-before spending its tab-click budget, and `ask` settles for an enabled Send
-before clicking — both best-effort with the click/eval-click/Enter fallbacks
-behind them.
 
 **Offline shelf (survives the browser close).** The `perch_think` /
 `perch_memory` / `perch_todo` / `perch_clock` / `perch_calc` / `perch_run_js` /
