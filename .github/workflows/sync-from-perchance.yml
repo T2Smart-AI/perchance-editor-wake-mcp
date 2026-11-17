@@ -1,0 +1,43 @@
+# Bench archive robot — keeps a dated copy of the live bench page in this repo.
+# Runs every Sunday at 03:00 UTC, and on demand from the Actions tab.
+# Read-only on the Perchance side (public API, no secrets). If the bench page
+# changes its shape, this still files whatever the API returns — never fails loud.
+name: sync-from-perchance
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch live bench source from Perchance
+        run: |
+          mkdir -p bench-archive
+          DATE=$(date -u +%F)
+          curl -sSL "https://perchance.org/api/getGeneratorsAndDependencies?generatorNames=perchance-editor-wake-mcp" \
+            -o "bench-archive/${DATE}.json"
+          echo "## bench archive ${DATE}" > "bench-archive/${DATE}.md"
+          echo "" >> "bench-archive/${DATE}.md"
+          echo "Source: https://perchance.org/perchance-editor-wake-mcp" >> "bench-archive/${DATE}.md"
+          echo "Raw: \`bench-archive/${DATE}.json\`" >> "bench-archive/${DATE}.md"
+          node -e "
+            const fs = require('fs');
+            const d = JSON.parse(fs.readFileSync('bench-archive/${DATE}.json', 'utf8'));
+            const g = (d.generators && d.generators['perchance-editor-wake-mcp']) || {};
+            const code = g.code || '';
+            fs.appendFileSync('bench-archive/${DATE}.md', 'main.pjs chars: ' + code.length + '\n');
+          " || echo "(size check skipped)" >> "bench-archive/${DATE}.md"
+      - name: Commit archive
+        run: |
+          git config user.name "bench-archive-bot"
+          git config user.email "bench-archive-bot@users.noreply.github.com"
+          git add bench-archive/
+          git diff --cached --quiet || git commit -m "bench archive $(date -u +%F)"
+          git push
